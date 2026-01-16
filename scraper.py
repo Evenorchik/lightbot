@@ -226,21 +226,41 @@ def parse_schedule_snapshot(timezone: str = "Europe/Kyiv") -> Optional[Dict]:
                 save_debug_artifacts(driver, driver.page_source)
             return None
         
-        # Ждем минимум 5 <p> внутри контейнера
+        # Ждем минимум 5 <p> внутри контейнера и чтобы в них был непустой текст
         try:
-            wait.until(lambda d: len(d.find_elements(By.CSS_SELECTOR, "div.power-off__text p")) >= 5)
+            wait.until(
+                lambda d: sum(
+                    1
+                    for p in d.find_elements(By.CSS_SELECTOR, "div.power-off__text p")
+                    if (p.get_attribute("innerText") or "").strip()
+                )
+                >= 5
+            )
         except TimeoutException:
-            logger.error("Таймаут: не найдено минимум 5 элементов <p> в div.power-off__text")
+            logger.error("Таймаут: не найдено минимум 5 непустых <p> в div.power-off__text")
             if driver:
                 save_debug_artifacts(driver, driver.page_source)
             return None
         
-        # Извлекаем все строки текста
+        # Извлекаем все строки текста (innerText устойчивее, чем .text в headless/при скрытии)
         paragraphs = driver.find_elements(By.CSS_SELECTOR, "div.power-off__text p")
-        lines = [p.text.strip() for p in paragraphs if p.text.strip()]
+        lines = []
+        for p in paragraphs:
+            t = (p.get_attribute("innerText") or "").strip()
+            if t:
+                lines.append(t)
         
         if len(lines) < 5:
-            logger.error(f"Недостаточно строк для парсинга: найдено {len(lines)}")
+            try:
+                title = driver.title
+                url = driver.current_url
+            except Exception:
+                title = ""
+                url = ""
+            logger.error(
+                f"Недостаточно строк для парсинга: найдено {len(lines)} (всего <p>: {len(paragraphs)}). "
+                f"title='{title}' url='{url}'"
+            )
             if driver:
                 save_debug_artifacts(driver, driver.page_source)
             return None
