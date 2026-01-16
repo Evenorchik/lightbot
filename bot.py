@@ -168,7 +168,8 @@ async def cmd_start(message: Message, state: FSMContext):
 async def handle_choose_group(message: Message):
     """Обробник кнопки 'Обрати групу'."""
     await message.answer(
-        "Оберіть вашу групу:",
+        "Оберіть вашу групу:\n"
+        "Як дізнатись групу - https://poweron.loe.lviv.ua/shedule-off\n",
         reply_markup=create_group_keyboard()
     )
 
