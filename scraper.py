@@ -39,6 +39,79 @@ def save_debug_artifacts(driver, html_content: str):
         logger.error(f"Ошибка при сохранении артефактов: {e}")
 
 
+def _try_accept_consent_in_current_context(driver, timeout_seconds: int = 3) -> bool:
+    """
+    Попытаться нажать кнопку согласия в текущем контексте (default content или iframe).
+    Возвращает True если клик выполнен.
+    """
+    wait_short = WebDriverWait(driver, timeout_seconds)
+    candidates = [
+        "//button[normalize-space()='Consent']",
+        "//button[contains(normalize-space(), 'Consent')]",
+        "//a[normalize-space()='Consent']",
+        "//input[@type='button' and contains(@value,'Consent')]",
+        # украинские варианты (на случай локализации)
+        "//button[contains(normalize-space(), 'Прийня')]",
+        "//button[contains(normalize-space(), 'Погодж')]",
+        "//button[contains(normalize-space(), 'Згоден')]",
+    ]
+    for xp in candidates:
+        try:
+            el = wait_short.until(EC.element_to_be_clickable((By.XPATH, xp)))
+            el.click()
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def accept_consent_if_present(driver) -> bool:
+    """
+    Принять cookie/consent попап, если он появился.
+    Часто CMP находится в iframe — пытаемся и там.
+    """
+    clicked = False
+
+    # 1) основной документ
+    try:
+        clicked = _try_accept_consent_in_current_context(driver, timeout_seconds=3) or clicked
+    except Exception:
+        pass
+
+    # 2) iframes
+    try:
+        for fr in driver.find_elements(By.CSS_SELECTOR, "iframe"):
+            try:
+                driver.switch_to.frame(fr)
+                if _try_accept_consent_in_current_context(driver, timeout_seconds=2):
+                    clicked = True
+                    break
+            except Exception:
+                continue
+            finally:
+                try:
+                    driver.switch_to.default_content()
+                except Exception:
+                    pass
+    except Exception:
+        try:
+            driver.switch_to.default_content()
+        except Exception:
+            pass
+
+    if clicked:
+        logger.info("Consent popup прийнято (кнопка Accept/Consent натиснута)")
+        # ждем, пока кнопка исчезнет (без sleep)
+        try:
+            WebDriverWait(driver, 10).until_not(
+                EC.presence_of_element_located((By.XPATH, "//button[contains(normalize-space(), 'Consent')]"))
+            )
+        except Exception:
+            pass
+
+    return clicked
+
+
 def extract_schedule_date(lines: List[str], timezone: str = "Europe/Kyiv") -> str:
     """
     Извлечь дату графика из текста.
@@ -216,6 +289,12 @@ def parse_schedule_snapshot(timezone: str = "Europe/Kyiv") -> Optional[Dict]:
         
         # Ждем загрузки контента
         wait = WebDriverWait(driver, 30)
+
+        # На VPS часто показывается consent-попап (cookie). Он блокирует контент — принимаем.
+        try:
+            accept_consent_if_present(driver)
+        except Exception as e:
+            logger.warning(f"Не удалось обработать consent popup: {e}")
         
         # Ждем присутствия div.power-off__text
         try:
