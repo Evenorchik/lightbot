@@ -168,7 +168,7 @@ async def cmd_start(message: Message, state: FSMContext):
 async def handle_choose_group(message: Message):
     """Обробник кнопки 'Обрати групу'."""
     await message.answer(
-        "Виберіть вашу групу:",
+        "Оберіть вашу групу:",
         reply_markup=create_group_keyboard()
     )
 
@@ -224,13 +224,15 @@ async def handle_what_to_do(message: Message):
 @router.message(Command("group"))
 async def cmd_group(message: Message, state: FSMContext):
     """Обработчик команды /group."""
-    text = "Оберіть вашу групу:"
+    text = "Оберіть вашу групу:\n"
+    "Як дізнатись групу - https://poweron.loe.lviv.ua/shedule-off\n"
     await message.answer(
         text,
         reply_markup=main_menu_keyboard()
     )
     await message.answer(
-        "Виберіть вашу групу:",
+        "Оберіть вашу групу:\n"
+        "Як дізнатись групу - https://poweron.loe.lviv.ua/shedule-off\n",
         reply_markup=create_group_keyboard()
     )
 
