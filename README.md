@@ -295,6 +295,15 @@ LOG_LEVEL=INFO
 
 ### 4) Запустить контейнер
 
+Перед первым запуском **обязательно создайте файл БД**, иначе Docker может создать папку `bot.db/`, и SQLite упадёт с `unable to open database file`:
+
+```bash
+rm -rf bot.db
+touch bot.db
+chmod 666 bot.db
+mkdir -p logs debug tmp
+```
+
 ```bash
 docker compose up -d --build
 ```

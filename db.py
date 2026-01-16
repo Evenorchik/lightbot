@@ -4,6 +4,7 @@ SQLite база данных для бота уведомлений о граф�
 import sqlite3
 import json
 import logging
+import os
 from typing import Optional, Dict, List
 from datetime import datetime, timezone
 
@@ -14,6 +15,13 @@ DB_FILE = "bot.db"
 
 def get_connection():
     """Создать соединение с БД."""
+    # В Docker bind-mount может создать директорию, если файла не было на хосте.
+    # Тогда SQLite не сможет открыть "файл" и упадёт с unable to open database file.
+    if os.path.isdir(DB_FILE):
+        raise sqlite3.OperationalError(
+            f"unable to open database file: '{DB_FILE}' is a directory. "
+            f"Fix: remove directory and create file (e.g. `rm -rf bot.db && touch bot.db`)."
+        )
     conn = sqlite3.connect(DB_FILE, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
