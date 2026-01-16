@@ -224,8 +224,10 @@ async def handle_what_to_do(message: Message):
 @router.message(Command("group"))
 async def cmd_group(message: Message, state: FSMContext):
     """Обработчик команды /group."""
-    text = "Оберіть вашу групу:\n"
-    "Як дізнатись групу - https://poweron.loe.lviv.ua/shedule-off\n"
+    text = (
+        "Оберіть вашу групу:\n"
+        "Як дізнатись групу - https://poweron.loe.lviv.ua/shedule-off\n"
+    )
     await message.answer(
         text,
         reply_markup=main_menu_keyboard()
