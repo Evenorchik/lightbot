@@ -100,7 +100,15 @@ def render_schedule_image(
                     return ImageFont.truetype(p, size)
             except Exception:
                 pass
+        # System fonts (Windows + Linux)
         for p in [
+            # Linux (Debian/Ubuntu) — DejaVu supports Cyrillic
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSansCondensed.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+            # Windows
             r"C:\Windows\Fonts\arial.ttf",
             r"C:\Windows\Fonts\segoeui.ttf",
             r"C:\Windows\Fonts\calibri.ttf",
