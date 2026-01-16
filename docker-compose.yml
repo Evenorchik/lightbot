@@ -1,0 +1,16 @@
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # Ensure Chromium is found inside container
+      CHROME_BINARY: /usr/bin/chromium
+    volumes:
+      - ./bot.db:/app/bot.db
+      - ./logs:/app/logs
+      - ./debug:/app/debug
+      - ./tmp:/app/tmp
+
+

@@ -1,0 +1,8 @@
+aiogram==3.7.0
+selenium==4.15.2
+undetected-chromedriver==3.5.4
+python-dotenv==1.0.0
+setuptools==80.9.0
+pillow==10.4.0
+tzdata==2025.2
+
