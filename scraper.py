@@ -8,6 +8,8 @@ import re
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime
 from zoneinfo import ZoneInfo
+import threading
+import atexit
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
@@ -17,6 +19,9 @@ import undetected_chromedriver as uc
 import utils
 
 logger = logging.getLogger(__name__)
+
+_DRIVER_LOCK = threading.Lock()
+_SHARED_DRIVER: Optional[uc.Chrome] = None
 
 
 def ensure_debug_dir():
@@ -110,6 +115,41 @@ def accept_consent_if_present(driver) -> bool:
             pass
 
     return clicked
+
+
+def _dispose_shared_driver(reason: str) -> None:
+    global _SHARED_DRIVER
+    with _DRIVER_LOCK:
+        d = _SHARED_DRIVER
+        _SHARED_DRIVER = None
+    if d is not None:
+        try:
+            d.quit()
+        except OSError as e:
+            logger.warning(f"Ошибка при закрытии драйвера (OSError) [{reason}]: {e}")
+        except Exception as e:
+            logger.warning(f"Ошибка при закрытии драйвера [{reason}]: {e}")
+
+
+def _get_or_create_shared_driver(options: uc.ChromeOptions) -> uc.Chrome:
+    """
+    Создать undetected-chromedriver один раз и переиспользовать.
+    Это уменьшает шанс утечек/Errno 24 (Too many open files) на VPS из-за повторных
+    операций patcher.auto() внутри undetected-chromedriver.
+    """
+    global _SHARED_DRIVER
+    with _DRIVER_LOCK:
+        if _SHARED_DRIVER is not None:
+            return _SHARED_DRIVER
+        d = uc.Chrome(options=options)
+        d.set_window_size(1365, 768)
+        _SHARED_DRIVER = d
+        return d
+
+
+@atexit.register
+def _cleanup_driver_on_exit():
+    _dispose_shared_driver("atexit")
 
 
 def extract_schedule_date(lines: List[str], timezone: str = "Europe/Kyiv") -> str:
@@ -281,8 +321,7 @@ def parse_schedule_snapshot(timezone: str = "Europe/Kyiv") -> Optional[Dict]:
             options.binary_location = chrome_binary
             logger.info(f"Используется Chrome из CHROME_BINARY: {chrome_binary}")
         
-        driver = uc.Chrome(options=options)
-        driver.set_window_size(1365, 768)
+        driver = _get_or_create_shared_driver(options)
         
         logger.info("Открываю страницу poweron.loe.lviv.ua")
         driver.get("https://poweron.loe.lviv.ua/")
@@ -364,6 +403,7 @@ def parse_schedule_snapshot(timezone: str = "Europe/Kyiv") -> Optional[Dict]:
                 save_debug_artifacts(driver, driver.page_source if 'page_source' in dir(driver) else "")
             except:
                 pass
+        _dispose_shared_driver("WebDriverException")
         return None
     except Exception as e:
         logger.error(f"Неожиданная ошибка при парсинге: {e}", exc_info=True)
@@ -372,13 +412,9 @@ def parse_schedule_snapshot(timezone: str = "Europe/Kyiv") -> Optional[Dict]:
                 save_debug_artifacts(driver, driver.page_source if 'page_source' in dir(driver) else "")
             except:
                 pass
+        _dispose_shared_driver("Exception")
         return None
     finally:
-        # Гарантированный cleanup
-        if driver is not None:
-            try:
-                driver.quit()
-            except OSError as e:
-                logger.warning(f"Ошибка при закрытии драйвера (OSError): {e}")
-            except Exception as e:
-                logger.warning(f"Ошибка при закрытии драйвера: {e}")
+        # Драйвер переиспользуется (см. _get_or_create_shared_driver).
+        # Закрываем его только при ошибках через _dispose_shared_driver() или при завершении процесса (atexit).
+        pass
