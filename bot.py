@@ -288,6 +288,48 @@ async def cmd_help(message: Message):
     await message.answer(text, reply_markup=main_menu_keyboard())
 
 
+@router.message(Command("broadcast"))
+async def cmd_broadcast(message: Message):
+    """
+    /broadcast <text> — рассылка всем пользователям (кроме админа).
+    Доступно только tg_user_id=395539341.
+    """
+    admin_id = 395539341
+    if not message.from_user or message.from_user.id != admin_id:
+        await message.answer("Немає доступу.", reply_markup=main_menu_keyboard())
+        return
+
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await message.answer(
+            "Використання: /broadcast <текст повідомлення>",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    text = parts[1].strip()
+    users = db.get_all_users()
+    sent = 0
+    failed = 0
+    for u in users:
+        if u.get("tg_user_id") == admin_id:
+            continue
+        chat_id = u.get("tg_chat_id")
+        if not chat_id:
+            continue
+        try:
+            await message.bot.send_message(chat_id, text, reply_markup=main_menu_keyboard())
+            sent += 1
+        except Exception as e:
+            failed += 1
+            logger.warning(f"broadcast_failed chat_id={chat_id}: {e}")
+
+    await message.answer(
+        f"Розсилка завершена. Надіслано: {sent}, помилки: {failed}.",
+        reply_markup=main_menu_keyboard(),
+    )
+
+
 @router.callback_query(F.data.startswith("set_group:"))
 async def process_group_selection(callback: CallbackQuery, state: FSMContext):
     """Обработчик выбора группы через inline-кнопку."""
@@ -461,6 +503,84 @@ async def send_schedule_updated_notification(
         except Exception as e2:
             logger.error(f"Ошибка при отправке fallback сообщения пользователю {user_id}: {e2}")
             return False
+    finally:
+        if image_path and os.path.exists(image_path):
+            try:
+                os.remove(image_path)
+            except Exception as e:
+                logger.warning(f"Не вдалося видалити тимчасовий файл {image_path}: {e}")
+
+
+async def send_schedule_updated_package(
+    bot: Bot,
+    chat_id: int,
+    user_id: int,
+    group_code: str,
+    schedule_date: str,
+    on_intervals: list[str],
+    off_intervals: list[str],
+    maybe_intervals: list[str],
+    timezone: str,
+    max_per_minute: int = 1,
+) -> bool:
+    """
+    Уведомление об обновлении графика:
+    1) "Графік було оновлено!"
+    2) Текст графика (без диффа)
+    3) Картинка
+    """
+    if not db.can_send_message(user_id, max_per_minute):
+        logger.info(f"Пропуск уведомления для пользователя {user_id} (антиспам)")
+        return False
+
+    normalized_tz = "Europe/Kyiv" if timezone == "Europe/Uzhgorod" else timezone
+    image_path = None
+    try:
+        # 1) сообщение об обновлении
+        await bot.send_message(
+            chat_id,
+            "Графік було оновлено!",
+            reply_markup=main_menu_keyboard(),
+        )
+
+        # 2) текст графика (без diff: не передаём old_data)
+        schedule_text = utils.format_schedule_message(
+            schedule_date,
+            group_code,
+            off_intervals,
+            on_intervals,
+            maybe_intervals,
+        )
+        await bot.send_message(
+            chat_id,
+            schedule_text,
+            parse_mode="Markdown",
+            reply_markup=main_menu_keyboard(),
+        )
+
+        # 3) картинка
+        now_dt = utils.get_now_in_tz(normalized_tz)
+        image_path = render.render_schedule_image(
+            schedule_date=schedule_date,
+            group_code=group_code,
+            on_intervals=on_intervals,
+            off_intervals=off_intervals,
+            now_dt=now_dt,
+            tz_name=normalized_tz,
+        )
+        caption = f"Група {group_code} • {schedule_date}"
+        await bot.send_photo(
+            chat_id,
+            FSInputFile(image_path),
+            caption=caption,
+            reply_markup=main_menu_keyboard(),
+        )
+
+        db.update_last_sent_at(user_id)
+        return True
+    except Exception as e:
+        logger.error(f"update_package_failed: {e}", exc_info=True)
+        return False
     finally:
         if image_path and os.path.exists(image_path):
             try:

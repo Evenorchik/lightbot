@@ -145,7 +145,7 @@ async def scrape_loop_task(bot_instance: Bot):
                     user_id = subscriber['tg_user_id']
                     chat_id = subscriber['tg_chat_id']
                     
-                    success = await bot.send_schedule_updated_notification(
+                    success = await bot.send_schedule_updated_package(
                         bot_instance,
                         chat_id,
                         user_id,
@@ -153,6 +153,7 @@ async def scrape_loop_task(bot_instance: Bot):
                         schedule_date,
                         on_intervals,
                         off_intervals,
+                        maybe_intervals,
                         TIMEZONE,
                         MAX_SEND_PER_MINUTE,
                     )

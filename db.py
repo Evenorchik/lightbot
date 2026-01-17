@@ -162,6 +162,16 @@ def get_subscribed_users_for_group(group_code: str) -> List[Dict]:
     return [dict(row) for row in rows]
 
 
+def get_all_users() -> List[Dict]:
+    """Получить всех пользователей (для broadcast)."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM users")
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
 def get_group_state(group_code: str) -> Optional[Dict]:
     """Получить последнее состояние группы."""
     conn = get_connection()
