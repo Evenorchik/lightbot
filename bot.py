@@ -404,3 +404,66 @@ async def send_notification(bot: Bot, chat_id: int, message_text: str, user_id: 
     except Exception as e:
         logger.error(f"Ошибка при отправке сообщения пользователю {user_id}: {e}")
         return False
+
+
+async def send_schedule_updated_notification(
+    bot: Bot,
+    chat_id: int,
+    user_id: int,
+    group_code: str,
+    schedule_date: str,
+    on_intervals: list[str],
+    off_intervals: list[str],
+    timezone: str,
+    max_per_minute: int = 1,
+) -> bool:
+    """
+    Уведомление об обновлении графика: ОДНО сообщение (photo) с подписью.
+    Так не спамим (1 msg/мин) и выполняем требование "сообщение + картинка".
+    """
+    if not db.can_send_message(user_id, max_per_minute):
+        logger.info(f"Пропуск уведомления для пользователя {user_id} (антиспам)")
+        return False
+
+    image_path = None
+    try:
+        normalized_tz = "Europe/Kyiv" if timezone == "Europe/Uzhgorod" else timezone
+        now_dt = utils.get_now_in_tz(normalized_tz)
+        image_path = render.render_schedule_image(
+            schedule_date=schedule_date,
+            group_code=group_code,
+            on_intervals=on_intervals,
+            off_intervals=off_intervals,
+            now_dt=now_dt,
+            tz_name=normalized_tz,
+        )
+
+        caption = f"Графік було оновлено!\nГрупа {group_code} • {schedule_date}"
+        await bot.send_photo(
+            chat_id,
+            FSInputFile(image_path),
+            caption=caption,
+            reply_markup=main_menu_keyboard(),
+        )
+        db.update_last_sent_at(user_id)
+        return True
+    except Exception as e:
+        logger.error(f"render_image_failed: {e}", exc_info=True)
+        # fallback: хотя бы текст
+        try:
+            await bot.send_message(
+                chat_id,
+                "Графік було оновлено!",
+                reply_markup=main_menu_keyboard(),
+            )
+            db.update_last_sent_at(user_id)
+            return True
+        except Exception as e2:
+            logger.error(f"Ошибка при отправке fallback сообщения пользователю {user_id}: {e2}")
+            return False
+    finally:
+        if image_path and os.path.exists(image_path):
+            try:
+                os.remove(image_path)
+            except Exception as e:
+                logger.warning(f"Не вдалося видалити тимчасовий файл {image_path}: {e}")

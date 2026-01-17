@@ -136,16 +136,6 @@ async def scrape_loop_task(bot_instance: Bot):
                 
                 db.save_group_state(group_code, schedule_date, new_hash, data_json)
                 
-                # Формируем сообщение
-                message_text = utils.format_schedule_message(
-                    schedule_date,
-                    group_code,
-                    off_intervals,
-                    on_intervals,
-                    maybe_intervals,
-                    old_state
-                )
-                
                 # Получаем подписчиков
                 subscribers = db.get_subscribed_users_for_group(group_code)
                 
@@ -155,12 +145,16 @@ async def scrape_loop_task(bot_instance: Bot):
                     user_id = subscriber['tg_user_id']
                     chat_id = subscriber['tg_chat_id']
                     
-                    success = await bot.send_notification(
+                    success = await bot.send_schedule_updated_notification(
                         bot_instance,
                         chat_id,
-                        message_text,
                         user_id,
-                        MAX_SEND_PER_MINUTE
+                        group_code,
+                        schedule_date,
+                        on_intervals,
+                        off_intervals,
+                        TIMEZONE,
+                        MAX_SEND_PER_MINUTE,
                     )
                     if success:
                         sent_count += 1
