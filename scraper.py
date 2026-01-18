@@ -6,7 +6,7 @@ import logging
 import os
 import re
 from typing import Dict, List, Optional, Tuple
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import threading
 import atexit
@@ -174,6 +174,75 @@ def extract_schedule_date(lines: List[str], timezone: str = "Europe/Kyiv") -> st
     return schedule_date
 
 
+def split_lines_into_sections(lines: List[str]) -> Dict[str, List[str]]:
+    """
+    Разбить lines на секции по заголовку:
+    "Графік погодинних відключень на DD.MM.YYYY"
+    Возвращает dict: {schedule_date_str: section_lines}
+    """
+    header_re = re.compile(r"Графік погодинних відключень на\s+(\d{2}\.\d{2}\.\d{4})")
+    sections: Dict[str, List[str]] = {}
+    current_date: Optional[str] = None
+
+    for line in lines:
+        t = line.strip()
+        if not t:
+            continue
+        m = header_re.search(t)
+        if m:
+            current_date = m.group(1)
+            sections.setdefault(current_date, [])
+            # сохраняем заголовок тоже (не обязательно, но полезно для extract_schedule_date fallback)
+            sections[current_date].append(t)
+            continue
+        if current_date is not None:
+            sections[current_date].append(t)
+
+    return sections
+
+
+def parse_groups_from_section_lines(section_lines: List[str]) -> Optional[Dict[str, Dict]]:
+    """
+    Парсит только строки групп из section_lines, возвращает groups_data (12 групп) либо None.
+    """
+    group_pattern = re.compile(r"^Група\s+(\d\.\d)\.")
+    groups_data: Dict[str, Dict] = {}
+    valid_groups = utils.VALID_GROUPS
+
+    for line in section_lines:
+        line = line.strip()
+        if not line:
+            continue
+        match = group_pattern.match(line)
+        if not match:
+            continue
+
+        group_code = match.group(1)
+        if group_code not in valid_groups:
+            continue
+
+        off_intervals_minutes = extract_group_off_intervals(line)
+        if not off_intervals_minutes:
+            logger.warning(f"Не найдено интервалов для группы {group_code}")
+            continue
+
+        off_merged = utils.merge_intervals(off_intervals_minutes)
+        on_intervals_minutes = utils.invert_intervals(off_merged)
+
+        groups_data[group_code] = {
+            "off": utils.intervals_to_strings(off_merged),
+            "on": utils.intervals_to_strings(on_intervals_minutes),
+            "maybe": [],
+        }
+
+    if len(groups_data.keys()) != 12:
+        missing = valid_groups - set(groups_data.keys())
+        logger.error(f"Недостаточно данных: найдено {len(groups_data.keys())} групп с данными. Отсутствуют: {missing}")
+        return None
+
+    return groups_data
+
+
 def extract_group_off_intervals(line: str) -> List[Tuple[int, int]]:
     """
     Извлечь OFF интервалы из строки группы.
@@ -201,91 +270,78 @@ def extract_group_off_intervals(line: str) -> List[Tuple[int, int]]:
 def parse_schedule_text(lines: List[str], timezone: str = "Europe/Kyiv") -> Optional[Dict]:
     """
     Парсить график из текстовых строк.
-    
-    Args:
-        lines: список строк из div.power-off__text p
-        timezone: таймзона для fallback даты
-    
-    Returns:
-        Dict с ключами:
-            - schedule_date: str
-            - groups: Dict[str, Dict] где ключ - код группы, значение - {
-                'off': List[str],
-                'on': List[str],
-                'maybe': List[str]
-            }
-        None если парсинг не удался
-    """
-    # Извлекаем дату
-    schedule_date = extract_schedule_date(lines, timezone)
-    
-    # Regex для определения строки группы: "Група X.Y."
-    group_pattern = re.compile(r"^Група\s+(\d\.\d)\.")
-    
-    groups_data = {}
-    valid_groups = utils.VALID_GROUPS
-    
-    # Парсим строки
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-        
-        # Проверяем, начинается ли строка с "Група"
-        match = group_pattern.match(line)
-        if not match:
-            continue
-        
-        group_code = match.group(1)
-        if group_code not in valid_groups:
-            logger.warning(f"Найдена неизвестная группа: {group_code}")
-            continue
-        
-        # Извлекаем OFF интервалы
-        off_intervals_minutes = extract_group_off_intervals(line)
-        
-        if not off_intervals_minutes:
-            logger.warning(f"Не найдено интервалов для группы {group_code}")
-            # Не считаем это критической ошибкой, просто пропускаем группу
-            continue
-        
-        # Нормализуем OFF интервалы (объединяем пересекающиеся)
-        off_merged = utils.merge_intervals(off_intervals_minutes)
-        
-        # Вычисляем ON интервалы как дополнение
-        on_intervals_minutes = utils.invert_intervals(off_merged)
-        
-        # Преобразуем в строки
-        off_strings = utils.intervals_to_strings(off_merged)
-        on_strings = utils.intervals_to_strings(on_intervals_minutes)
-        
-        groups_data[group_code] = {
-            'off': off_strings,
-            'on': on_strings,
-            'maybe': []  # MAYBE отсутствует в текущем формате
+
+    Возвращает:
+        {
+          "today": {"schedule_date": "...", "groups": {...}},
+          "tomorrow": {"schedule_date": "...", "groups": {...}} | None
         }
-    
-    # Валидация: должно быть найдено ровно 12 групп
-    found_groups = set(groups_data.keys())
-    expected_groups = valid_groups
-    
-    if len(found_groups) != 12:
-        missing = expected_groups - found_groups
-        logger.error(f"Недостаточно данных: найдено {len(found_groups)} групп с данными. Отсутствуют: {missing}")
+    """
+    # Даты "сегодня/завтра" в указанной таймзоне
+    try:
+        tz = ZoneInfo(timezone)
+    except Exception:
+        tz = ZoneInfo("Europe/Kyiv")
+    today_dt = datetime.now(tz).date()
+    today_str = today_dt.strftime("%d.%m.%Y")
+    tomorrow_dt = today_dt + timedelta(days=1)
+    tomorrow_str = tomorrow_dt.strftime("%d.%m.%Y")
+
+    sections = split_lines_into_sections(lines)
+    if not sections:
+        # fallback: один блок как раньше
+        schedule_date = extract_schedule_date(lines, timezone)
+        groups = parse_groups_from_section_lines(lines)
+        if not groups:
+            return None
+        return {"today": {"schedule_date": schedule_date, "groups": groups}, "tomorrow": None}
+
+    today_section_lines = sections.get(today_str)
+    tomorrow_section_lines = sections.get(tomorrow_str)
+
+    # fallback selection если exact match не найден
+    if today_section_lines is None:
+        # берем минимальную дату из секций как "сегодня"
+        try:
+            parsed_dates = sorted(
+                (utils.parse_date_ddmmyyyy(d), d) for d in sections.keys()
+            )
+            if parsed_dates:
+                today_section_lines = sections[parsed_dates[0][1]]
+                today_str = parsed_dates[0][1]
+        except Exception:
+            pass
+
+    if tomorrow_section_lines is None:
+        # берем максимальную дату из секций (если секций > 1)
+        try:
+            parsed_dates = sorted(
+                (utils.parse_date_ddmmyyyy(d), d) for d in sections.keys()
+            )
+            if len(parsed_dates) >= 2:
+                tomorrow_section_lines = sections[parsed_dates[-1][1]]
+                tomorrow_str = parsed_dates[-1][1]
+        except Exception:
+            pass
+
+    if not today_section_lines:
+        logger.error("Не удалось выбрать секцию на сегодня")
         return None
-    
-    if found_groups != expected_groups:
-        missing = expected_groups - found_groups
-        logger.error(f"Найдены не все группы. Отсутствуют: {missing}")
+
+    today_groups = parse_groups_from_section_lines(today_section_lines)
+    if not today_groups:
         return None
-    
-    result = {
-        'schedule_date': schedule_date,
-        'groups': groups_data
-    }
-    
-    logger.info(f"Успешно распарсено: дата {schedule_date}, найдено {len(found_groups)} групп")
-    return result
+
+    tomorrow_snapshot = None
+    if tomorrow_section_lines and tomorrow_str != today_str:
+        tomorrow_groups = parse_groups_from_section_lines(tomorrow_section_lines)
+        if tomorrow_groups:
+            tomorrow_snapshot = {"schedule_date": tomorrow_str, "groups": tomorrow_groups}
+
+    logger.info(
+        f"Успешно распарсено: сегодня {today_str} (12 групп), завтра {tomorrow_str if tomorrow_snapshot else 'нет'}"
+    )
+    return {"today": {"schedule_date": today_str, "groups": today_groups}, "tomorrow": tomorrow_snapshot}
 
 
 def parse_schedule_snapshot(timezone: str = "Europe/Kyiv") -> Optional[Dict]:

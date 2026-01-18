@@ -4,6 +4,7 @@ Telegram бот на aiogram v3 для уведомлений о графике 
 import logging
 import json
 import os
+from datetime import timedelta
 from aiogram import Bot, Router, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, FSInputFile
 from aiogram.filters import Command
@@ -25,9 +26,16 @@ class GroupSelection(StatesGroup):
 
 def main_menu_keyboard() -> ReplyKeyboardMarkup:
     """Створити нижнє меню з двома кнопками."""
+    # Кнопка "на завтра" должна содержать дату
+    tz_env = os.getenv("TIMEZONE", "Europe/Kyiv")
+    tz_name = "Europe/Kyiv" if tz_env == "Europe/Uzhgorod" else tz_env
+    now = utils.get_now_in_tz(tz_name)
+    tomorrow_str = (now.date() + timedelta(days=1)).strftime("%d.%m.%Y")
+
     keyboard = ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="Обрати групу"), KeyboardButton(text="Показати графік")],
+            [KeyboardButton(text=f"Графік на завтра {tomorrow_str}")],
             [KeyboardButton(text="Що робити?")],
         ],
         resize_keyboard=True,
@@ -142,6 +150,77 @@ async def send_schedule_for_group(bot: Bot, chat_id: int, group_code: str, timez
                 logger.warning(f"Не вдалося видалити тимчасовий файл {image_path}: {e}")
 
 
+async def send_tomorrow_schedule_for_group(bot: Bot, chat_id: int, group_code: str, timezone: str) -> bool:
+    """
+    Відправити графік на завтра для групи (текст + картинка) або повідомлення якщо ще немає.
+    """
+    normalized_tz = "Europe/Kyiv" if timezone == "Europe/Uzhgorod" else timezone
+    now = utils.get_now_in_tz(normalized_tz)
+    tomorrow_str = (now.date() + timedelta(days=1)).strftime("%d.%m.%Y")
+
+    st = db.get_group_state_tomorrow(group_code)
+    if not st or st.get("schedule_date") != tomorrow_str:
+        await bot.send_message(
+            chat_id,
+            "Графіка на завтра ще нема, чекаємо...",
+            reply_markup=main_menu_keyboard(),
+        )
+        return False
+
+    image_path = None
+    try:
+        data = json.loads(st["data_json"])
+        off = data.get("off", [])
+        on = data.get("on", [])
+        maybe = data.get("maybe", [])
+
+        schedule_text = utils.format_schedule_message(
+            st["schedule_date"],
+            group_code,
+            off,
+            on,
+            maybe,
+        )
+        await bot.send_message(
+            chat_id,
+            schedule_text,
+            parse_mode="Markdown",
+            reply_markup=main_menu_keyboard(),
+        )
+
+        now_dt = utils.get_now_in_tz(normalized_tz)
+        image_path = render.render_schedule_image(
+            schedule_date=st["schedule_date"],
+            group_code=group_code,
+            on_intervals=on,
+            off_intervals=off,
+            now_dt=now_dt,
+            tz_name=normalized_tz,
+        )
+        caption = f"Група {group_code} • {st['schedule_date']}"
+        await bot.send_photo(
+            chat_id,
+            FSInputFile(image_path),
+            caption=caption,
+            reply_markup=main_menu_keyboard(),
+        )
+        return True
+    except Exception as e:
+        logger.error(f"Помилка при відправці графіку на завтра: {e}", exc_info=True)
+        await bot.send_message(
+            chat_id,
+            "Помилка при отриманні графіку.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return False
+    finally:
+        if image_path and os.path.exists(image_path):
+            try:
+                os.remove(image_path)
+            except Exception as e:
+                logger.warning(f"Не вдалося видалити тимчасовий файл {image_path}: {e}")
+
+
 @router.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext):
     """Обработчик команды /start."""
@@ -192,6 +271,22 @@ async def handle_show_schedule(message: Message):
     tz_env = os.getenv('TIMEZONE', 'Europe/Kyiv')
     timezone = "Europe/Kyiv" if tz_env == "Europe/Uzhgorod" else tz_env
     await send_schedule_for_group(message.bot, message.chat.id, group_code, timezone)
+
+
+@router.message(F.text.regexp(r"^Графік на завтра\s+\d{2}\.\d{2}\.\d{4}$"))
+async def handle_show_tomorrow_schedule(message: Message):
+    user_id = message.from_user.id
+    user = db.get_user(user_id)
+    if not user or not user.get("group_code"):
+        await message.answer(
+            "Спочатку оберіть групу (кнопка «Обрати групу»).",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    tz_env = os.getenv("TIMEZONE", "Europe/Kyiv")
+    timezone = "Europe/Kyiv" if tz_env == "Europe/Uzhgorod" else tz_env
+    await send_tomorrow_schedule_for_group(message.bot, message.chat.id, user["group_code"], timezone)
 
 
 @router.message(F.text == "Що робити?")
@@ -580,6 +675,83 @@ async def send_schedule_updated_package(
         return True
     except Exception as e:
         logger.error(f"update_package_failed: {e}", exc_info=True)
+        return False
+    finally:
+        if image_path and os.path.exists(image_path):
+            try:
+                os.remove(image_path)
+            except Exception as e:
+                logger.warning(f"Не вдалося видалити тимчасовий файл {image_path}: {e}")
+
+
+async def send_schedule_tomorrow_updated_package(
+    bot: Bot,
+    chat_id: int,
+    user_id: int,
+    group_code: str,
+    schedule_date: str,
+    on_intervals: list[str],
+    off_intervals: list[str],
+    maybe_intervals: list[str],
+    timezone: str,
+    max_per_minute: int,
+    is_first_for_this_date: bool,
+) -> bool:
+    """
+    Уведомление про завтра: НА ЗАВТРА + текст + картинка, без диффа.
+    """
+    if not db.can_send_message(user_id, max_per_minute):
+        logger.info(f"Пропуск уведомления для пользователя {user_id} (антиспам)")
+        return False
+
+    normalized_tz = "Europe/Kyiv" if timezone == "Europe/Uzhgorod" else timezone
+    image_path = None
+    try:
+        # 1) сообщение
+        first_line = "З'явився графік на завтра" if is_first_for_this_date else "Графік на завтра було оновлено!"
+        await bot.send_message(
+            chat_id,
+            f"НА ЗАВТРА\n{first_line}",
+            reply_markup=main_menu_keyboard(),
+        )
+
+        # 2) текст графика (без diff)
+        schedule_text = utils.format_schedule_message(
+            schedule_date,
+            group_code,
+            off_intervals,
+            on_intervals,
+            maybe_intervals,
+        )
+        await bot.send_message(
+            chat_id,
+            schedule_text,
+            parse_mode="Markdown",
+            reply_markup=main_menu_keyboard(),
+        )
+
+        # 3) картинка
+        now_dt = utils.get_now_in_tz(normalized_tz)
+        image_path = render.render_schedule_image(
+            schedule_date=schedule_date,
+            group_code=group_code,
+            on_intervals=on_intervals,
+            off_intervals=off_intervals,
+            now_dt=now_dt,
+            tz_name=normalized_tz,
+        )
+        caption = f"НА ЗАВТРА • Група {group_code} • {schedule_date}"
+        await bot.send_photo(
+            chat_id,
+            FSInputFile(image_path),
+            caption=caption,
+            reply_markup=main_menu_keyboard(),
+        )
+
+        db.update_last_sent_at(user_id)
+        return True
+    except Exception as e:
+        logger.error(f"tomorrow_update_package_failed: {e}", exc_info=True)
         return False
     finally:
         if image_path and os.path.exists(image_path):

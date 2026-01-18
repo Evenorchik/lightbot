@@ -53,6 +53,17 @@ def init_db():
             updated_at TEXT NOT NULL
         )
     """)
+
+    # Таблица состояния групп на завтра
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS group_state_tomorrow (
+            group_code TEXT PRIMARY KEY,
+            schedule_date TEXT NOT NULL,
+            hash TEXT NOT NULL,
+            data_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
     
     conn.commit()
     conn.close()
@@ -192,6 +203,37 @@ def save_group_state(group_code: str, schedule_date: str, hash_value: str, data_
     now = datetime.now(timezone.utc).isoformat()
     cursor.execute("""
         INSERT INTO group_state (group_code, schedule_date, hash, data_json, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(group_code) DO UPDATE SET
+            schedule_date = excluded.schedule_date,
+            hash = excluded.hash,
+            data_json = excluded.data_json,
+            updated_at = excluded.updated_at
+    """, (group_code, schedule_date, hash_value, data_json, now))
+    conn.commit()
+    conn.close()
+
+
+def get_group_state_tomorrow(group_code: str) -> Optional[Dict]:
+    """Получить последнее состояние группы на завтра."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT * FROM group_state_tomorrow WHERE group_code = ?",
+        (group_code,),
+    )
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def save_group_state_tomorrow(group_code: str, schedule_date: str, hash_value: str, data_json: str):
+    """Сохранить состояние группы на завтра."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    now = datetime.now(timezone.utc).isoformat()
+    cursor.execute("""
+        INSERT INTO group_state_tomorrow (group_code, schedule_date, hash, data_json, updated_at)
         VALUES (?, ?, ?, ?, ?)
         ON CONFLICT(group_code) DO UPDATE SET
             schedule_date = excluded.schedule_date,

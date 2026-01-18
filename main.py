@@ -98,72 +98,117 @@ async def scrape_loop_task(bot_instance: Bot):
                 logger.warning("Парсинг не удался, пропускаем итерацию")
                 await asyncio.sleep(POLL_INTERVAL_SECONDS)
                 continue
-            
-            schedule_date = snapshot['schedule_date']
-            groups_data = snapshot['groups']
-            
-            # Обрабатываем каждую группу
-            for group_code, intervals in groups_data.items():
-                off_intervals = intervals.get('off', [])
-                on_intervals = intervals.get('on', [])
-                maybe_intervals = intervals.get('maybe', [])
-                
-                # Вычисляем хеш
-                new_hash = utils.compute_group_hash(
-                    schedule_date,
-                    off_intervals,
-                    on_intervals,
-                    maybe_intervals
-                )
-                
-                # Получаем старое состояние
-                old_state = db.get_group_state(group_code)
-                
-                # Проверяем изменение
-                if old_state and old_state['hash'] == new_hash:
-                    # Без изменений
-                    continue
-                
-                # Изменение обнаружено!
-                logger.info(f"Обнаружено изменение для группы {group_code}")
-                
-                # Сохраняем новое состояние
-                data_json = json.dumps({
-                    'off': off_intervals,
-                    'on': on_intervals,
-                    'maybe': maybe_intervals
-                }, ensure_ascii=False)
-                
-                db.save_group_state(group_code, schedule_date, new_hash, data_json)
-                
-                # Получаем подписчиков
-                subscribers = db.get_subscribed_users_for_group(group_code)
-                
-                # Отправляем уведомления
-                sent_count = 0
-                for subscriber in subscribers:
-                    user_id = subscriber['tg_user_id']
-                    chat_id = subscriber['tg_chat_id']
-                    
-                    success = await bot.send_schedule_updated_package(
-                        bot_instance,
-                        chat_id,
-                        user_id,
-                        group_code,
-                        schedule_date,
-                        on_intervals,
-                        off_intervals,
-                        maybe_intervals,
-                        TIMEZONE,
-                        MAX_SEND_PER_MINUTE,
+
+            today_snapshot = snapshot.get("today")
+            tomorrow_snapshot = snapshot.get("tomorrow")
+
+            # -----------------------
+            # TODAY
+            # -----------------------
+            if today_snapshot:
+                schedule_date = today_snapshot["schedule_date"]
+                groups_data = today_snapshot["groups"]
+
+                for group_code, intervals in groups_data.items():
+                    off_intervals = intervals.get("off", [])
+                    on_intervals = intervals.get("on", [])
+                    maybe_intervals = intervals.get("maybe", [])
+
+                    new_hash = utils.compute_group_hash(
+                        schedule_date, off_intervals, on_intervals, maybe_intervals
                     )
-                    if success:
-                        sent_count += 1
-                    
-                    # Небольшая задержка между отправками
-                    await asyncio.sleep(0.1)
-                
-                logger.info(f"Отправлено {sent_count} уведомлений для группы {group_code}")
+
+                    old_state = db.get_group_state(group_code)
+                    if old_state and old_state["hash"] == new_hash:
+                        continue
+
+                    logger.info(f"Обнаружено изменение для группы {group_code} (сьогодні)")
+
+                    data_json = json.dumps(
+                        {"off": off_intervals, "on": on_intervals, "maybe": maybe_intervals},
+                        ensure_ascii=False,
+                    )
+                    db.save_group_state(group_code, schedule_date, new_hash, data_json)
+
+                    subscribers = db.get_subscribed_users_for_group(group_code)
+                    sent_count = 0
+                    for subscriber in subscribers:
+                        user_id = subscriber["tg_user_id"]
+                        chat_id = subscriber["tg_chat_id"]
+
+                        success = await bot.send_schedule_updated_package(
+                            bot_instance,
+                            chat_id,
+                            user_id,
+                            group_code,
+                            schedule_date,
+                            on_intervals,
+                            off_intervals,
+                            maybe_intervals,
+                            TIMEZONE,
+                            MAX_SEND_PER_MINUTE,
+                        )
+                        if success:
+                            sent_count += 1
+                        await asyncio.sleep(0.1)
+
+                    logger.info(f"Отправлено {sent_count} уведомлений для группы {group_code} (сьогодні)")
+
+            # -----------------------
+            # TOMORROW
+            # -----------------------
+            if tomorrow_snapshot:
+                schedule_date = tomorrow_snapshot["schedule_date"]
+                groups_data = tomorrow_snapshot["groups"]
+
+                for group_code, intervals in groups_data.items():
+                    off_intervals = intervals.get("off", [])
+                    on_intervals = intervals.get("on", [])
+                    maybe_intervals = intervals.get("maybe", [])
+
+                    new_hash = utils.compute_group_hash(
+                        schedule_date, off_intervals, on_intervals, maybe_intervals
+                    )
+
+                    old_state = db.get_group_state_tomorrow(group_code)
+                    if old_state and old_state["hash"] == new_hash:
+                        continue
+
+                    is_first_for_this_date = (not old_state) or (old_state.get("schedule_date") != schedule_date)
+                    logger.info(
+                        f"Обнаружено изменение для группы {group_code} (завтра, first={is_first_for_this_date})"
+                    )
+
+                    data_json = json.dumps(
+                        {"off": off_intervals, "on": on_intervals, "maybe": maybe_intervals},
+                        ensure_ascii=False,
+                    )
+                    db.save_group_state_tomorrow(group_code, schedule_date, new_hash, data_json)
+
+                    subscribers = db.get_subscribed_users_for_group(group_code)
+                    sent_count = 0
+                    for subscriber in subscribers:
+                        user_id = subscriber["tg_user_id"]
+                        chat_id = subscriber["tg_chat_id"]
+
+                        success = await bot.send_schedule_tomorrow_updated_package(
+                            bot_instance,
+                            chat_id,
+                            user_id,
+                            group_code,
+                            schedule_date,
+                            on_intervals,
+                            off_intervals,
+                            maybe_intervals,
+                            TIMEZONE,
+                            MAX_SEND_PER_MINUTE,
+                            is_first_for_this_date,
+                        )
+                        if success:
+                            sent_count += 1
+                        await asyncio.sleep(0.1)
+
+                    logger.info(f"Отправлено {sent_count} уведомлений для группы {group_code} (завтра)")
             
             logger.info("Парсинг завершен успешно")
             
