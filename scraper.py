@@ -10,18 +10,31 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import threading
 import atexit
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, WebDriverException
-import undetected_chromedriver as uc
 import utils
 
 logger = logging.getLogger(__name__)
 
 _DRIVER_LOCK = threading.Lock()
-_SHARED_DRIVER: Optional[uc.Chrome] = None
+_SHARED_DRIVER = None
+
+# Selenium/undetected-chromedriver нужны только для parse_schedule_snapshot().
+# Держим импорты опциональными, чтобы можно было импортировать модуль и тестировать
+# чистые функции парсинга текста без установленного selenium в окружении.
+try:
+    from selenium import webdriver  # type: ignore
+    from selenium.webdriver.common.by import By  # type: ignore
+    from selenium.webdriver.support.ui import WebDriverWait  # type: ignore
+    from selenium.webdriver.support import expected_conditions as EC  # type: ignore
+    from selenium.common.exceptions import TimeoutException, WebDriverException  # type: ignore
+    import undetected_chromedriver as uc  # type: ignore
+except Exception:  # ImportError и другие проблемы окружения
+    webdriver = None  # type: ignore
+    By = None  # type: ignore
+    WebDriverWait = None  # type: ignore
+    EC = None  # type: ignore
+    TimeoutException = Exception  # type: ignore
+    WebDriverException = Exception  # type: ignore
+    uc = None  # type: ignore
 
 
 def ensure_debug_dir():
@@ -131,7 +144,7 @@ def _dispose_shared_driver(reason: str) -> None:
             logger.warning(f"Ошибка при закрытии драйвера [{reason}]: {e}")
 
 
-def _get_or_create_shared_driver(options: uc.ChromeOptions) -> uc.Chrome:
+def _get_or_create_shared_driver(options):
     """
     Создать undetected-chromedriver один раз и переиспользовать.
     Это уменьшает шанс утечек/Errno 24 (Too many open files) на VPS из-за повторных
@@ -141,6 +154,8 @@ def _get_or_create_shared_driver(options: uc.ChromeOptions) -> uc.Chrome:
     with _DRIVER_LOCK:
         if _SHARED_DRIVER is not None:
             return _SHARED_DRIVER
+        if uc is None:
+            raise RuntimeError("undetected_chromedriver is not available (missing dependency)")
         d = uc.Chrome(options=options)
         d.set_window_size(1365, 768)
         _SHARED_DRIVER = d
@@ -160,15 +175,23 @@ def extract_schedule_date(lines: List[str], timezone: str = "Europe/Kyiv") -> st
     Если не найдена - использует сегодняшнюю дату в указанной таймзоне.
     """
     date_pattern = re.compile(r"Графік погодинних відключень на\s+(\d{2}\.\d{2}\.\d{4})")
+    any_date = re.compile(r"(\d{2}\.\d{2}\.\d{4})")
     
     for line in lines:
         match = date_pattern.search(line)
         if match:
             return match.group(1)
+
+    # Fallback №2: иногда заголовок может отличаться, но дата присутствует в строке с "Граф".
+    for line in lines:
+        if "Граф" in line:
+            m = any_date.search(line)
+            if m:
+                return m.group(1)
     
-    # Fallback: сегодняшняя дата в указанной таймзоне
-    tz = ZoneInfo(timezone)
-    today = datetime.now(tz)
+    # Fallback: сегодняшняя дата в указанной таймзоне.
+    # На Windows ZoneInfo может требовать пакет tzdata — используем общий хелпер с fallback на UTC.
+    today = utils.get_now_in_tz(timezone)
     schedule_date = today.strftime("%d.%m.%Y")
     logger.warning(f"Дата графика не найдена на странице, используется сегодняшняя: {schedule_date}")
     return schedule_date
@@ -180,7 +203,11 @@ def split_lines_into_sections(lines: List[str]) -> Dict[str, List[str]]:
     "Графік погодинних відключень на DD.MM.YYYY"
     Возвращает dict: {schedule_date_str: section_lines}
     """
-    header_re = re.compile(r"Графік погодинних відключень на\s+(\d{2}\.\d{2}\.\d{4})")
+    # Важно: на практике заголовок может немного отличаться, а в некоторых окружениях
+    # regex с кириллицей ведёт себя нестабильно. Поэтому используем простую проверку
+    # подстроки + извлечение даты по цифрам.
+    header_marker = "Графік погодинних відключень"
+    any_date = re.compile(r"(\d{2}\.\d{2}\.\d{4})")
     sections: Dict[str, List[str]] = {}
     current_date: Optional[str] = None
 
@@ -188,14 +215,18 @@ def split_lines_into_sections(lines: List[str]) -> Dict[str, List[str]]:
         t = line.strip()
         if not t:
             continue
-        m = header_re.search(t)
-        if m:
-            current_date = m.group(1)
-            sections.setdefault(current_date, [])
-            # сохраняем заголовок тоже (не обязательно, но полезно для extract_schedule_date fallback)
-            sections[current_date].append(t)
-            continue
+        # 1) Строгий путь: маркер заголовка + дата в этой строке
+        if header_marker in t or t.startswith("Графік"):
+            m = any_date.search(t)
+            if m:
+                current_date = m.group(1)
+                sections.setdefault(current_date, [])
+                sections[current_date].append(t)
+                continue
+
+        # 2) Старое поведение: если секция уже выбрана, добавляем строки внутрь секции
         if current_date is not None:
+            sections.setdefault(current_date, [])
             sections[current_date].append(t)
 
     return sections
@@ -277,12 +308,10 @@ def parse_schedule_text(lines: List[str], timezone: str = "Europe/Kyiv") -> Opti
           "tomorrow": {"schedule_date": "...", "groups": {...}} | None
         }
     """
-    # Даты "сегодня/завтра" в указанной таймзоне
-    try:
-        tz = ZoneInfo(timezone)
-    except Exception:
-        tz = ZoneInfo("Europe/Kyiv")
-    today_dt = datetime.now(tz).date()
+    # Даты "сегодня/завтра" в указанной таймзоне.
+    # Используем utils.get_now_in_tz(), чтобы устойчиво работать на Windows без tzdata.
+    now_dt = utils.get_now_in_tz(timezone)
+    today_dt = now_dt.date()
     today_str = today_dt.strftime("%d.%m.%Y")
     tomorrow_dt = today_dt + timedelta(days=1)
     tomorrow_str = tomorrow_dt.strftime("%d.%m.%Y")
@@ -295,6 +324,30 @@ def parse_schedule_text(lines: List[str], timezone: str = "Europe/Kyiv") -> Opti
         if not groups:
             return None
         return {"today": {"schedule_date": schedule_date, "groups": groups}, "tomorrow": None}
+
+    # Если на странице только один заголовок (часто вечером показывают уже "на завтра"),
+    # не нужно автоматически считать его "today" — иначе таблица group_state_tomorrow
+    # никогда не заполнится и бот будет писать "Графіка на завтра ще нема".
+    if len(sections) == 1:
+        only_date = next(iter(sections.keys()))
+        only_lines = sections.get(only_date) or []
+        only_groups = parse_groups_from_section_lines(only_lines)
+        if not only_groups:
+            return None
+
+        today_snapshot = {"schedule_date": only_date, "groups": only_groups} if only_date == today_str else None
+        tomorrow_snapshot = {"schedule_date": only_date, "groups": only_groups} if only_date == tomorrow_str else None
+
+        # Если дата не совпала ни с today, ни с tomorrow (например, из-за таймзоны/кэша),
+        # оставляем поведение по умолчанию: считаем её "today".
+        if not today_snapshot and not tomorrow_snapshot:
+            today_snapshot = {"schedule_date": only_date, "groups": only_groups}
+
+        logger.info(
+            f"Успешно распарсено (1 секция): today={today_snapshot['schedule_date'] if today_snapshot else 'нет'}, "
+            f"tomorrow={tomorrow_snapshot['schedule_date'] if tomorrow_snapshot else 'нет'}"
+        )
+        return {"today": today_snapshot, "tomorrow": tomorrow_snapshot}
 
     today_section_lines = sections.get(today_str)
     tomorrow_section_lines = sections.get(tomorrow_str)
@@ -361,6 +414,9 @@ def parse_schedule_snapshot(timezone: str = "Europe/Kyiv") -> Optional[Dict]:
             }
         None если парсинг не удался
     """
+    if uc is None or WebDriverWait is None or By is None or EC is None:
+        raise RuntimeError("Selenium/undetected-chromedriver dependencies are not available")
+
     driver = None
     try:
         # Настройка драйвера
@@ -391,38 +447,46 @@ def parse_schedule_snapshot(timezone: str = "Europe/Kyiv") -> Optional[Dict]:
         except Exception as e:
             logger.warning(f"Не удалось обработать consent popup: {e}")
         
-        # Ждем присутствия div.power-off__text
+        # Ждем присутствия хотя бы одного div.power-off__text
         try:
-            container = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "div.power-off__text")))
+            wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "div.power-off__text")))
         except TimeoutException:
             logger.error("Таймаут при загрузке контейнера div.power-off__text")
             if driver:
                 save_debug_artifacts(driver, driver.page_source)
             return None
-        
-        # Ждем минимум 5 <p> внутри контейнера и чтобы в них был непустой текст
+
+        # На странице часто два блока (сегодня/завтра) и второй может догружаться чуть позже.
+        # Пытаемся подождать появление второго блока, но не считаем это ошибкой.
         try:
-            wait.until(
-                lambda d: sum(
-                    1
-                    for p in d.find_elements(By.CSS_SELECTOR, "div.power-off__text p")
-                    if (p.get_attribute("innerText") or "").strip()
-                )
-                >= 5
+            WebDriverWait(driver, 10).until(
+                lambda d: len(d.find_elements(By.CSS_SELECTOR, "div.power-off__text")) >= 2
             )
+        except Exception:
+            pass
+        
+        # Сайт может отдавать ДВА блока (на сегодня/на завтра) как два отдельных контейнера.
+        # Считываем innerText каждого контейнера целиком: это надежнее, чем собирать только <p>.
+        try:
+            wait.until(lambda d: len(d.find_elements(By.CSS_SELECTOR, "div.power-off__text")) >= 1)
         except TimeoutException:
-            logger.error("Таймаут: не найдено минимум 5 непустых <p> в div.power-off__text")
+            logger.error("Таймаут: не найдено ни одного div.power-off__text")
             if driver:
                 save_debug_artifacts(driver, driver.page_source)
             return None
-        
-        # Извлекаем все строки текста (innerText устойчивее, чем .text в headless/при скрытии)
-        paragraphs = driver.find_elements(By.CSS_SELECTOR, "div.power-off__text p")
-        lines = []
-        for p in paragraphs:
-            t = (p.get_attribute("innerText") or "").strip()
-            if t:
-                lines.append(t)
+
+        containers = driver.find_elements(By.CSS_SELECTOR, "div.power-off__text")
+        lines: List[str] = []
+        for c in containers:
+            block_text = (c.get_attribute("innerText") or "").strip()
+            if not block_text:
+                continue
+            for ln in block_text.splitlines():
+                t = (ln or "").strip()
+                if t:
+                    lines.append(t)
+            # Разделитель между блоками, чтобы точно не "слипались" секции
+            lines.append("")
         
         if len(lines) < 5:
             try:
@@ -432,7 +496,7 @@ def parse_schedule_snapshot(timezone: str = "Europe/Kyiv") -> Optional[Dict]:
                 title = ""
                 url = ""
             logger.error(
-                f"Недостаточно строк для парсинга: найдено {len(lines)} (всего <p>: {len(paragraphs)}). "
+                f"Недостаточно строк для парсинга: найдено {len(lines)} (containers: {len(containers)}). "
                 f"title='{title}' url='{url}'"
             )
             if driver:
