@@ -5,6 +5,7 @@ import asyncio
 import logging
 import json
 import os
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from dotenv import load_dotenv
@@ -88,6 +89,7 @@ async def scrape_loop_task(bot_instance: Bot):
     logger.info(f"Запуск цикла парсинга (интервал: {POLL_INTERVAL_SECONDS} сек)")
     
     while True:
+        iter_started = time.time()
         try:
             logger.info("Начало парсинга сайта...")
             
@@ -109,6 +111,10 @@ async def scrape_loop_task(bot_instance: Bot):
                 schedule_date = today_snapshot["schedule_date"]
                 groups_data = today_snapshot["groups"]
 
+                # 1) Сначала быстро обновляем БД для всех групп.
+                # Это критично: рассылка может занимать десятки минут/часы при большом числе подписчиков,
+                # и без этого пользователи "поздних" групп будут видеть старые данные при запросе графика.
+                changed_today: list[tuple[str, list[str], list[str], list[str]]] = []
                 for group_code, intervals in groups_data.items():
                     off_intervals = intervals.get("off", [])
                     on_intervals = intervals.get("on", [])
@@ -129,7 +135,10 @@ async def scrape_loop_task(bot_instance: Bot):
                         ensure_ascii=False,
                     )
                     db.save_group_state(group_code, schedule_date, new_hash, data_json)
+                    changed_today.append((group_code, on_intervals, off_intervals, maybe_intervals))
 
+                # 2) Затем рассылаем уведомления только по изменившимся группам.
+                for group_code, on_intervals, off_intervals, maybe_intervals in changed_today:
                     subscribers = db.get_subscribed_users_for_group(group_code)
                     sent_count = 0
                     for subscriber in subscribers:
@@ -161,6 +170,8 @@ async def scrape_loop_task(bot_instance: Bot):
                 schedule_date = tomorrow_snapshot["schedule_date"]
                 groups_data = tomorrow_snapshot["groups"]
 
+                # 1) Сначала быстро обновляем БД для всех групп (на завтра).
+                changed_tomorrow: list[tuple[str, list[str], list[str], list[str], bool]] = []
                 for group_code, intervals in groups_data.items():
                     off_intervals = intervals.get("off", [])
                     on_intervals = intervals.get("on", [])
@@ -184,7 +195,10 @@ async def scrape_loop_task(bot_instance: Bot):
                         ensure_ascii=False,
                     )
                     db.save_group_state_tomorrow(group_code, schedule_date, new_hash, data_json)
+                    changed_tomorrow.append((group_code, on_intervals, off_intervals, maybe_intervals, is_first_for_this_date))
 
+                # 2) Затем рассылаем уведомления.
+                for group_code, on_intervals, off_intervals, maybe_intervals, is_first_for_this_date in changed_tomorrow:
                     subscribers = db.get_subscribed_users_for_group(group_code)
                     sent_count = 0
                     for subscriber in subscribers:
@@ -210,7 +224,8 @@ async def scrape_loop_task(bot_instance: Bot):
 
                     logger.info(f"Отправлено {sent_count} уведомлений для группы {group_code} (завтра)")
             
-            logger.info("Парсинг завершен успешно")
+            elapsed = time.time() - iter_started
+            logger.info(f"Парсинг завершен успешно (итерация {elapsed:.1f} сек)")
             
         except Exception as e:
             logger.error(f"Ошибка в цикле парсинга: {e}", exc_info=True)

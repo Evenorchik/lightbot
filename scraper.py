@@ -5,6 +5,7 @@
 import logging
 import os
 import re
+import time
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -426,6 +427,9 @@ def parse_schedule_snapshot(timezone: str = "Europe/Kyiv") -> Optional[Dict]:
         options.add_argument('--no-sandbox')
         options.add_argument('--disable-dev-shm-usage')
         options.add_argument('--disable-blink-features=AutomationControlled')
+        # Снижаем шанс получить устаревший контент из браузерного кэша
+        options.add_argument('--disable-application-cache')
+        options.add_argument('--disk-cache-size=0')
         
         # Поддержка CHROME_BINARY из переменной окружения
         chrome_binary = os.getenv('CHROME_BINARY')
@@ -435,8 +439,17 @@ def parse_schedule_snapshot(timezone: str = "Europe/Kyiv") -> Optional[Dict]:
         
         driver = _get_or_create_shared_driver(options)
         
-        logger.info("Открываю страницу poweron.loe.lviv.ua")
-        driver.get("https://poweron.loe.lviv.ua/")
+        # Отключаем cache на уровне CDP (если доступно)
+        try:
+            driver.execute_cdp_cmd("Network.enable", {})
+            driver.execute_cdp_cmd("Network.setCacheDisabled", {"cacheDisabled": True})
+        except Exception:
+            pass
+
+        # Cache-buster в URL (на случай CDN/service-worker/browser cache)
+        url = f"https://poweron.loe.lviv.ua/?_={int(time.time())}"
+        logger.info(f"Открываю страницу poweron.loe.lviv.ua ({url})")
+        driver.get(url)
         
         # Ждем загрузки контента
         wait = WebDriverWait(driver, 30)
