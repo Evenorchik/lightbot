@@ -64,6 +64,85 @@ TIMEZONE = "Europe/Kyiv" if tz_env == "Europe/Uzhgorod" else tz_env
 
 logger.info("Запуск бота...")
 
+NOTIFY_SEND_TIMEOUT_SECONDS = float(os.getenv("NOTIFY_SEND_TIMEOUT_SECONDS", "25"))
+NOTIFICATION_QUEUE_MAXSIZE = int(os.getenv("NOTIFICATION_QUEUE_MAXSIZE", "500"))
+
+
+async def notification_worker(bot_instance: Bot, queue: "asyncio.Queue[dict]") -> None:
+    """
+    Отдельный воркер для уведомлений.
+    Важно: scrape_loop не должен блокироваться на долгих рассылках, иначе БД и парсинг "отстают".
+    """
+    logger.info("Notification worker запущен")
+    while True:
+        job = await queue.get()
+        try:
+            kind = job.get("kind")
+            group_code = job["group_code"]
+            schedule_date = job["schedule_date"]
+            on_intervals = job["on_intervals"]
+            off_intervals = job["off_intervals"]
+            maybe_intervals = job.get("maybe_intervals", [])
+            is_first_for_this_date = bool(job.get("is_first_for_this_date", False))
+
+            subscribers = db.get_subscribed_users_for_group(group_code)
+            sent_count = 0
+
+            for subscriber in subscribers:
+                user_id = subscriber["tg_user_id"]
+                chat_id = subscriber["tg_chat_id"]
+                try:
+                    if kind == "today":
+                        coro = bot.send_schedule_updated_package(
+                            bot_instance,
+                            chat_id,
+                            user_id,
+                            group_code,
+                            schedule_date,
+                            on_intervals,
+                            off_intervals,
+                            maybe_intervals,
+                            TIMEZONE,
+                            MAX_SEND_PER_MINUTE,
+                        )
+                    elif kind == "tomorrow":
+                        coro = bot.send_schedule_tomorrow_updated_package(
+                            bot_instance,
+                            chat_id,
+                            user_id,
+                            group_code,
+                            schedule_date,
+                            on_intervals,
+                            off_intervals,
+                            maybe_intervals,
+                            TIMEZONE,
+                            MAX_SEND_PER_MINUTE,
+                            is_first_for_this_date,
+                        )
+                    else:
+                        logger.warning(f"Unknown notification job kind={kind}")
+                        continue
+
+                    success = await asyncio.wait_for(coro, timeout=NOTIFY_SEND_TIMEOUT_SECONDS)
+                    if success:
+                        sent_count += 1
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        f"notify_timeout kind={kind} group={group_code} user={user_id} timeout={NOTIFY_SEND_TIMEOUT_SECONDS}s"
+                    )
+                except Exception as e:
+                    logger.warning(f"notify_failed kind={kind} group={group_code} user={user_id}: {e}")
+
+                # маленькая пауза чтобы не долбить Telegram
+                await asyncio.sleep(0.1)
+
+            logger.info(f"Notification job done kind={kind} group={group_code} sent={sent_count}")
+        except Exception as e:
+            logger.error(f"notification_worker_failed: {e}", exc_info=True)
+        finally:
+            queue.task_done()
+
+
 def cleanup_tmp_dir(max_age_seconds: int = 86400) -> None:
     """
     Удалить временные PNG из tmp/ старше 1 дня (или другого значения).
@@ -84,7 +163,7 @@ def cleanup_tmp_dir(max_age_seconds: int = 86400) -> None:
         logger.info(f"Очищено tmp/: видалено {removed} старих файлів")
 
 
-async def scrape_loop_task(bot_instance: Bot):
+async def scrape_loop_task(bot_instance: Bot, notify_queue: "asyncio.Queue[dict]"):
     """Основной цикл парсинга сайта."""
     logger.info(f"Запуск цикла парсинга (интервал: {POLL_INTERVAL_SECONDS} сек)")
     
@@ -137,31 +216,21 @@ async def scrape_loop_task(bot_instance: Bot):
                     db.save_group_state(group_code, schedule_date, new_hash, data_json)
                     changed_today.append((group_code, on_intervals, off_intervals, maybe_intervals))
 
-                # 2) Затем рассылаем уведомления только по изменившимся группам.
+                # 2) Уведомления — в очередь, чтобы scrape loop не блокировался.
                 for group_code, on_intervals, off_intervals, maybe_intervals in changed_today:
-                    subscribers = db.get_subscribed_users_for_group(group_code)
-                    sent_count = 0
-                    for subscriber in subscribers:
-                        user_id = subscriber["tg_user_id"]
-                        chat_id = subscriber["tg_chat_id"]
-
-                        success = await bot.send_schedule_updated_package(
-                            bot_instance,
-                            chat_id,
-                            user_id,
-                            group_code,
-                            schedule_date,
-                            on_intervals,
-                            off_intervals,
-                            maybe_intervals,
-                            TIMEZONE,
-                            MAX_SEND_PER_MINUTE,
-                        )
-                        if success:
-                            sent_count += 1
-                        await asyncio.sleep(0.1)
-
-                    logger.info(f"Отправлено {sent_count} уведомлений для группы {group_code} (сьогодні)")
+                    if notify_queue.full():
+                        logger.warning("notification_queue_full: dropping today job")
+                        break
+                    notify_queue.put_nowait(
+                        {
+                            "kind": "today",
+                            "group_code": group_code,
+                            "schedule_date": schedule_date,
+                            "on_intervals": on_intervals,
+                            "off_intervals": off_intervals,
+                            "maybe_intervals": maybe_intervals,
+                        }
+                    )
 
             # -----------------------
             # TOMORROW
@@ -197,35 +266,27 @@ async def scrape_loop_task(bot_instance: Bot):
                     db.save_group_state_tomorrow(group_code, schedule_date, new_hash, data_json)
                     changed_tomorrow.append((group_code, on_intervals, off_intervals, maybe_intervals, is_first_for_this_date))
 
-                # 2) Затем рассылаем уведомления.
+                # 2) Уведомления — в очередь.
                 for group_code, on_intervals, off_intervals, maybe_intervals, is_first_for_this_date in changed_tomorrow:
-                    subscribers = db.get_subscribed_users_for_group(group_code)
-                    sent_count = 0
-                    for subscriber in subscribers:
-                        user_id = subscriber["tg_user_id"]
-                        chat_id = subscriber["tg_chat_id"]
-
-                        success = await bot.send_schedule_tomorrow_updated_package(
-                            bot_instance,
-                            chat_id,
-                            user_id,
-                            group_code,
-                            schedule_date,
-                            on_intervals,
-                            off_intervals,
-                            maybe_intervals,
-                            TIMEZONE,
-                            MAX_SEND_PER_MINUTE,
-                            is_first_for_this_date,
-                        )
-                        if success:
-                            sent_count += 1
-                        await asyncio.sleep(0.1)
-
-                    logger.info(f"Отправлено {sent_count} уведомлений для группы {group_code} (завтра)")
+                    if notify_queue.full():
+                        logger.warning("notification_queue_full: dropping tomorrow job")
+                        break
+                    notify_queue.put_nowait(
+                        {
+                            "kind": "tomorrow",
+                            "group_code": group_code,
+                            "schedule_date": schedule_date,
+                            "on_intervals": on_intervals,
+                            "off_intervals": off_intervals,
+                            "maybe_intervals": maybe_intervals,
+                            "is_first_for_this_date": is_first_for_this_date,
+                        }
+                    )
             
             elapsed = time.time() - iter_started
-            logger.info(f"Парсинг завершен успешно (итерация {elapsed:.1f} сек)")
+            logger.info(
+                f"Парсинг завершен успешно (итерация {elapsed:.1f} сек, notify_queue={notify_queue.qsize()})"
+            )
             
         except Exception as e:
             logger.error(f"Ошибка в цикле парсинга: {e}", exc_info=True)
@@ -261,11 +322,14 @@ async def main():
     dp = Dispatcher(storage=storage)
     dp.include_router(bot.router)
     bot_instance = Bot(token=TELEGRAM_BOT_TOKEN)
+
+    notify_queue: asyncio.Queue[dict] = asyncio.Queue(maxsize=NOTIFICATION_QUEUE_MAXSIZE)
     
     # Запускаем обе задачи
     await asyncio.gather(
         dp.start_polling(bot_instance),
-        scrape_loop_task(bot_instance)
+        scrape_loop_task(bot_instance, notify_queue),
+        notification_worker(bot_instance, notify_queue),
     )
 
 
